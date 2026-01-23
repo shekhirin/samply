@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 use debugid::DebugId;
 use linux_perf_data::jitdump::{
-    JitCodeDebugInfoRecord, JitCodeLoadRecord, JitDumpReader, JitDumpRecord, JitDumpRecordHeader,
-    JitDumpRecordType,
+    JitCodeDebugInfoRecord, JitCodeInlineInfoRecord, JitCodeLoadRecord, JitDumpReader,
+    JitDumpRecord, JitDumpRecordHeader, JitDumpRecordType,
 };
 use linux_perf_data::linux_perf_event_reader::RawData;
 use linux_perf_data::Endianness;
@@ -70,6 +70,7 @@ impl JitDumpIndex {
         let mut relative_addresses = Vec::new();
         let mut cumulative_address = 0;
         let mut offset_and_len_of_pending_debug_record = None;
+        let mut pending_inline_records = Vec::new();
         while let Some(record_header) = reader.next_record_header()? {
             match record_header.record_type {
                 JitDumpRecordType::JIT_CODE_LOAD => {
@@ -82,15 +83,23 @@ impl JitDumpIndex {
                     };
                     let code_debug_info_record_offset_and_len =
                         offset_and_len_of_pending_debug_record.take();
+                    let inline_records = std::mem::take(&mut pending_inline_records);
                     let relative_address = cumulative_address;
                     cumulative_address += record.code_bytes.len() as u32;
+                    // eprintln!("JIT_CODE_LOAD at {} for function {}", raw_record.start_offset, std::str::from_utf8(&record.function_name.as_slice()).unwrap());
 
                     entries.push(JitDumpIndexEntry {
                         code_load_record_offset: raw_record.start_offset,
+                        code_load_record_avma: record.code_addr,
                         code_bytes_offset: raw_record.start_offset
                             + record.code_bytes_offset_from_record_header_start() as u64,
                         name_len: record.function_name.len() as u32,
                         code_debug_info_record_offset_and_len,
+                        inline_records: if inline_records.is_empty() {
+                            None
+                        } else {
+                            Some(inline_records)
+                        },
                         code_bytes_len: record.code_bytes.len() as u64,
                     });
                     relative_addresses.push(relative_address);
@@ -102,6 +111,14 @@ impl JitDumpIndex {
                     }
                     offset_and_len_of_pending_debug_record =
                         Some((offset, record_header.total_size));
+                }
+                JitDumpRecordType::JIT_CODE_INLINE_INFO => {
+                    let offset = reader.next_record_offset();
+                    // eprintln!("JIT_CODE_INLINE_INFO at {offset}");
+                    if !reader.skip_next_record()? {
+                        break;
+                    }
+                    pending_inline_records.push((offset, record_header.total_size));
                 }
                 _ => {
                     // Skip other record types.
@@ -120,7 +137,7 @@ impl JitDumpIndex {
     }
 
     /// Returns (entry index, entry relative address, offset from entry start)
-    pub fn lookup_relative_address(&self, address: u32) -> Option<(usize, u32, u64)> {
+    pub fn lookup_relative_address(&self, address: u32) -> Option<(usize, u32, u64, u64)> {
         let index = match self.relative_addresses.binary_search(&address) {
             Ok(i) => i,
             Err(0) => return None,
@@ -132,11 +149,12 @@ impl JitDumpIndex {
         if offset_relative_to_symbol >= desc.code_bytes_len {
             return None;
         }
-        Some((index, symbol_address, offset_relative_to_symbol))
+        let avma = desc.code_load_record_avma + offset_relative_to_symbol;
+        Some((index, symbol_address, offset_relative_to_symbol, avma))
     }
 
     /// Returns (entry index, entry relative address, offset from entry start)
-    pub fn lookup_offset(&self, offset: u64) -> Option<(usize, u32, u64)> {
+    pub fn lookup_offset(&self, offset: u64) -> Option<(usize, u32, u64, u64)> {
         let index = match self
             .entries
             .binary_search_by_key(&offset, |entry| entry.code_bytes_offset)
@@ -152,16 +170,19 @@ impl JitDumpIndex {
             return None;
         }
         let symbol_address = self.relative_addresses[index];
-        Some((index, symbol_address, offset_relative_to_symbol))
+        let avma = desc.code_load_record_avma + offset_relative_to_symbol;
+        Some((index, symbol_address, offset_relative_to_symbol, avma))
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct JitDumpIndexEntry {
     pub code_load_record_offset: u64,
+    pub code_load_record_avma: u64,
     pub code_bytes_offset: u64,
     pub name_len: u32,
     pub code_debug_info_record_offset_and_len: Option<(u64, u32)>,
+    pub inline_records: Option<Vec<(u64, u32)>>,
     pub code_bytes_len: u64,
 }
 
@@ -224,6 +245,7 @@ pub struct JitDumpSymbolMapInnerWrapper<'data>(pub Box<dyn SymbolMapTrait + Send
 struct JitDumpSymbolMapCache<'a, T: FileContents> {
     names: HashMap<usize, &'a [u8]>,
     debug_infos: HashMap<usize, JitCodeDebugInfoRecord<'a>>,
+    inline_records: HashMap<usize, Vec<JitCodeInlineInfoRecord<'a>>>,
     string_interner: SymbolMapStringInterner<'a>,
     data: &'a FileContentsWrapper<T>,
     index: &'a JitDumpIndex,
@@ -238,6 +260,7 @@ impl<'a, T: FileContents> JitDumpSymbolMapCache<'a, T> {
         Self {
             names: HashMap::new(),
             debug_infos: HashMap::new(),
+            inline_records: HashMap::new(),
             string_interner: SymbolMapStringInterner::new(generation),
             data,
             index,
@@ -277,6 +300,32 @@ impl<'a, T: FileContents> JitDumpSymbolMapCache<'a, T> {
             }
         }
     }
+
+    pub fn get_inline_info(
+        &mut self,
+        entry_index: usize,
+    ) -> Option<&[JitCodeInlineInfoRecord<'a>]> {
+        match self.inline_records.entry(entry_index) {
+            Entry::Occupied(entry) => Some(entry.into_mut()),
+            Entry::Vacant(entry) => {
+                let desc = &self.index.entries[entry_index];
+                let records = desc.inline_records.as_deref()?;
+                let mut inline_record_data = Vec::new();
+                for (record_start, record_len) in records {
+                    let record_data = self
+                        .data
+                        .read_bytes_at(*record_start, (*record_len).into())
+                        .ok()?;
+                    let mut record_data = RawData::Single(record_data);
+                    record_data.skip(JitDumpRecordHeader::SIZE).ok()?;
+                    let record =
+                        JitCodeInlineInfoRecord::parse(self.index.endian, record_data).ok()?;
+                    inline_record_data.push(record);
+                }
+                Some(entry.insert(inline_record_data))
+            }
+        }
+    }
 }
 
 impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
@@ -285,6 +334,7 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
         index: usize,
         symbol_address: u32,
         offset_relative_to_symbol: u64,
+        lookup_avma: u64,
     ) -> Option<SyncAddressInfo> {
         let mut cache = self.cache.lock().unwrap();
         let name_bytes = cache.get_function_name(index)?;
@@ -296,6 +346,39 @@ impl<'a, T: FileContents> JitDumpSymbolMapInner<'a, T> {
             size: Some(self.index.entries[index].code_bytes_len as u32),
             name: name.into(),
         };
+        if let Some(inline_info) = cache.get_inline_info(index) {
+            // eprintln!("Have inline info with {} records for function {}", inline_info.len(), std::str::from_utf8(name_bytes).unwrap());
+            let index = match inline_info.binary_search_by_key(&lookup_avma, |r| r.code_addr) {
+                Ok(i) => i,
+                Err(0) => return None,
+                Err(i) => i - 1,
+            };
+            let inline_record = inline_info[index].clone();
+            let frames: Vec<_> = inline_record
+                .entries
+                .iter()
+                .map(|entry| {
+                    let line = entry.line;
+                    let file_path = match entry.file_path.as_slice() {
+                        Cow::Borrowed(s) => {
+                            cache.string_interner.intern_cow(String::from_utf8_lossy(s))
+                        }
+                        Cow::Owned(s) => cache
+                            .string_interner
+                            .intern_owned(&String::from_utf8_lossy(&s)),
+                    };
+                    FrameDebugInfo {
+                        function: Some(name.into()),
+                        file_path: Some(file_path.into()),
+                        line_number: Some(line),
+                    }
+                })
+                .collect();
+            return Some(SyncAddressInfo {
+                symbol,
+                frames: Some(FramesLookupResult::Available(frames)),
+            });
+        }
         let Some(debug_info) = cache.get_debug_info(index) else {
             return Some(SyncAddressInfo {
                 symbol,
@@ -342,7 +425,7 @@ impl<T: FileContents> SymbolMapTrait for JitDumpSymbolMapInner<'_, T> {
     }
 
     fn lookup_sync(&self, address: LookupAddress) -> Option<SyncAddressInfo> {
-        let (index, symbol_address, offset_from_symbol) = match address {
+        let (index, symbol_address, offset_from_symbol, avma) = match address {
             LookupAddress::Relative(address) => self.index.lookup_relative_address(address)?,
             LookupAddress::Svma(_) => {
                 // SVMAs are not meaningful for JitDump files.
@@ -350,7 +433,7 @@ impl<T: FileContents> SymbolMapTrait for JitDumpSymbolMapInner<'_, T> {
             }
             LookupAddress::FileOffset(offset) => self.index.lookup_offset(offset)?,
         };
-        self.lookup_by_entry_index(index, symbol_address, offset_from_symbol)
+        self.lookup_by_entry_index(index, symbol_address, offset_from_symbol, avma)
     }
 
     fn resolve_function_name(&self, handle: FunctionNameHandle) -> Cow<'_, str> {

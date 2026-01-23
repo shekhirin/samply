@@ -57,7 +57,8 @@ yoke-derive = "0.8"
 nom = "7.1.1"
 zerocopy = "0.8"
 zerocopy-derive = "0.8"
-linux-perf-data = "0.12"
+# linux-perf-data = "0.12"
+linux-perf-data = { path = "../../linux-perf-data" }
 crc32fast = "1.4.2"
 
 [dev-dependencies]
