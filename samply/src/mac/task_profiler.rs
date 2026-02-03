@@ -572,10 +572,11 @@ impl TaskProfiler {
         while let Ok(process_specific_path) = self.path_receiver.try_recv() {
             match process_specific_path {
                 ProcessSpecificPath::Jitdump(jitdump_path) => {
+                    use crate::shared::jitdump_manager::ThreadOrTid;
                     // TODO: Detect which thread the jitdump file is opened on, and use that thread's
                     // thread handle so that the JitFunctionAdd markers are put on that thread in the profile.
                     self.jitdump_manager.add_jitdump_path(
-                        self.main_thread_handle,
+                        ThreadOrTid::Thread(self.main_thread_handle),
                         jitdump_path,
                         Vec::new(),
                     );
@@ -612,6 +613,7 @@ impl TaskProfiler {
             profile,
             self.jit_function_recycler.as_mut(),
             &self.timestamp_converter,
+            &mut |_tid, _profile| unreachable!("macOS uses ThreadHandle, not tid"),
         );
     }
 
@@ -648,6 +650,7 @@ impl TaskProfiler {
             profile,
             self.jit_function_recycler.as_mut(),
             &self.timestamp_converter,
+            &mut |_tid, _profile| unreachable!("macOS uses ThreadHandle, not tid"),
         );
         let mut marker_spans = Vec::new();
         for (thread_handle, marker_file_path) in self.marker_file_paths {
