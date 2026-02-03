@@ -824,12 +824,11 @@ where
         };
 
         if filename.starts_with("jit-") && filename.ends_with(".dump") {
+            use crate::shared::jitdump_manager::ThreadOrTid;
             let jitdump_path = Path::new(path);
             let process = self.processes.get_by_pid(pid, &mut self.profile);
-            let thread = process.threads.get_thread_by_tid(tid, &mut self.profile);
-            let profile_thread = thread.profile_thread;
             process.jitdump_manager.add_jitdump_path(
-                profile_thread,
+                ThreadOrTid::Tid(tid),
                 jitdump_path,
                 self.aux_file_lookup_dirs.clone(),
             );
@@ -839,13 +838,7 @@ where
         if filename.starts_with("marker-") && filename.ends_with(".txt") {
             let marker_file_path = Path::new(path);
             let process = self.processes.get_by_pid(pid, &mut self.profile);
-            let thread = process.threads.get_thread_by_tid(tid, &mut self.profile);
-            let profile_thread = thread.profile_thread;
-            process.add_marker_file_path(
-                profile_thread,
-                marker_file_path,
-                self.aux_file_lookup_dirs.clone(),
-            );
+            process.add_marker_file_path(tid, marker_file_path, self.aux_file_lookup_dirs.clone());
             return true;
         }
 
@@ -992,13 +985,12 @@ where
         } else {
             // New thread within the same process.
             // eprintln!("New thread: pid={}, old_tid={}, new_tid={}", e.pid, e.ptid, e.tid);
-            let parent_thread = parent_process
-                .threads
-                .get_thread_by_tid(e.ptid, &mut self.profile);
-            let parent_thread_name = parent_thread.name.clone();
+
+            // Don't use parent's name here - the thread will get its own name via
+            // a COMM event, and recycling happens there based on the actual name.
             parent_process.recycle_or_get_new_thread(
                 e.tid,
-                parent_thread_name,
+                None,
                 start_time,
                 &mut self.profile,
             );

@@ -32,7 +32,7 @@ pub struct Process<U> {
     pub unresolved_samples: UnresolvedSamples,
     pub jit_app_cache_mapping_ops: LibMappingOpQueue,
     pub jit_function_recycler: Option<JitFunctionRecycler>,
-    marker_file_paths: Vec<(ThreadHandle, PathBuf, Vec<PathBuf>)>,
+    marker_file_paths: Vec<(i32, PathBuf, Vec<PathBuf>)>,
     pub prev_mm_filepages_size: i64,
     pub prev_mm_anonpages_size: i64,
     pub prev_mm_swapents_size: i64,
@@ -168,17 +168,13 @@ where
             profile,
             self.jit_function_recycler.as_mut(),
             timestamp_converter,
+            &mut |tid, profile| self.threads.get_thread_by_tid(tid, profile).profile_thread,
         );
     }
 
-    pub fn add_marker_file_path(
-        &mut self,
-        thread: ThreadHandle,
-        path: &Path,
-        lookup_dirs: Vec<PathBuf>,
-    ) {
+    pub fn add_marker_file_path(&mut self, tid: i32, path: &Path, lookup_dirs: Vec<PathBuf>) {
         self.marker_file_paths
-            .push((thread, path.to_owned(), lookup_dirs));
+            .push((tid, path.to_owned(), lookup_dirs));
     }
 
     pub fn notify_dead(&mut self, end_time: Timestamp, profile: &mut Profile) {
@@ -211,6 +207,7 @@ where
             profile,
             self.jit_function_recycler.as_mut(),
             timestamp_converter,
+            &mut |tid, profile| self.threads.get_thread_by_tid(tid, profile).profile_thread,
         );
 
         if !self.jit_app_cache_mapping_ops.is_empty() {
@@ -218,10 +215,11 @@ where
         }
 
         let mut marker_spans = Vec::new();
-        for (thread_handle, marker_file_path, lookup_dirs) in self.marker_file_paths {
+        for (tid, marker_file_path, lookup_dirs) in self.marker_file_paths {
             if let Ok(marker_spans_from_this_file) =
                 get_markers(&marker_file_path, &lookup_dirs, *timestamp_converter)
             {
+                let thread_handle = self.threads.get_thread_by_tid(tid, profile).profile_thread;
                 marker_spans.extend(marker_spans_from_this_file.into_iter().map(|span| {
                     MarkerSpanOnThread {
                         thread_handle,

@@ -15,9 +15,15 @@ use super::lib_mappings::{
 use super::timestamp_converter::TimestampConverter;
 use super::utils::open_file_with_fallback;
 
+#[derive(Debug, Clone, Copy)]
+pub enum ThreadOrTid {
+    Thread(ThreadHandle),
+    Tid(i32),
+}
+
 #[derive(Debug)]
 pub struct JitDumpManager {
-    pending_jitdump_paths: Vec<(ThreadHandle, PathBuf, Vec<PathBuf>)>,
+    pending_jitdump_paths: Vec<(ThreadOrTid, PathBuf, Vec<PathBuf>)>,
     processors: Vec<SingleJitDumpProcessor>,
     unlink_after_open: bool,
     should_emit_jit_markers: bool,
@@ -35,12 +41,12 @@ impl JitDumpManager {
 
     pub fn add_jitdump_path(
         &mut self,
-        thread: ThreadHandle,
+        thread_or_tid: ThreadOrTid,
         path: impl Into<PathBuf>,
         lookup_dirs: Vec<PathBuf>,
     ) {
         self.pending_jitdump_paths
-            .push((thread, path.into(), lookup_dirs));
+            .push((thread_or_tid, path.into(), lookup_dirs));
     }
 
     pub fn process_pending_records(
@@ -49,9 +55,10 @@ impl JitDumpManager {
         profile: &mut Profile,
         mut recycler: Option<&mut JitFunctionRecycler>,
         timestamp_converter: &TimestampConverter,
+        tid_to_thread_handle: &mut impl FnMut(i32, &mut Profile) -> ThreadHandle,
     ) {
         self.pending_jitdump_paths
-            .retain_mut(|(thread, path, lookup_dirs)| {
+            .retain_mut(|(thread_or_tid, path, lookup_dirs)| {
                 fn jitdump_reader_for_path(
                     path: &Path,
                     lookup_dirs: &[PathBuf],
@@ -74,8 +81,12 @@ impl JitDumpManager {
                     reader.header(),
                     profile,
                 );
+                let thread_handle = match *thread_or_tid {
+                    ThreadOrTid::Thread(handle) => handle,
+                    ThreadOrTid::Tid(tid) => tid_to_thread_handle(tid, profile),
+                };
                 self.processors
-                    .push(SingleJitDumpProcessor::new(reader, lib_handle, *thread));
+                    .push(SingleJitDumpProcessor::new(reader, lib_handle, thread_handle));
                 false // "Do not retain", i.e. remove from pending_jitdump_paths
             });
 
@@ -96,8 +107,15 @@ impl JitDumpManager {
         profile: &mut Profile,
         recycler: Option<&mut JitFunctionRecycler>,
         timestamp_converter: &TimestampConverter,
+        tid_to_thread_handle: &mut impl FnMut(i32, &mut Profile) -> ThreadHandle,
     ) -> Vec<LibMappingOpQueue> {
-        self.process_pending_records(jit_category_manager, profile, recycler, timestamp_converter);
+        self.process_pending_records(
+            jit_category_manager,
+            profile,
+            recycler,
+            timestamp_converter,
+            tid_to_thread_handle,
+        );
         self.processors
             .into_iter()
             .map(|processor| processor.finish(profile))
